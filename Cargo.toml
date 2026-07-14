@@ -1,0 +1,12 @@
+[package]
+name = "herdr-system-notify-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Event-driven bridge: herdr agent-status changes -> click-to-focus macOS notifications"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true

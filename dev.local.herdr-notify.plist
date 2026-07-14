@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the herdr notify bridge.
+  install.sh substitutes __HOME__ with $HOME and writes the result to
+  ~/Library/LaunchAgents/dev.local.herdr-notify.plist (launchd does not expand
+  ~ or $HOME in ProgramArguments, so the path must be absolute).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.local.herdr-notify</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/herdr-system-notify-bridge</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
