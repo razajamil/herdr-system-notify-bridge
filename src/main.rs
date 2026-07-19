@@ -43,6 +43,19 @@ fn sock_path() -> String {
 fn log_path() -> String {
     format!("{}/.config/herdr/herdr-notify-bridge.log", home())
 }
+/// Pane id of the most recent agent to enter an attention state. Written on
+/// every `blocked`/`done` transition (whether or not a notification fired), so
+/// the `herdr-focus-last` hotkey can jump there even with no live toast.
+fn last_attention_path() -> String {
+    format!("{}/.config/herdr/last-attention-pane", home())
+}
+
+/// Record the most-recently-attention pane for the focus-last hotkey.
+fn record_attention(pane: &str) {
+    if let Err(e) = std::fs::write(last_attention_path(), pane) {
+        log(&format!("failed to record last-attention pane {}: {}", pane, e));
+    }
+}
 
 fn now() -> String {
     Command::new("/bin/date")
@@ -245,6 +258,10 @@ fn run() -> std::io::Result<()> {
                 if !entered {
                     continue;
                 }
+                // Record for the focus-last hotkey regardless of whether we
+                // notify — you may want to jump back to an agent that went
+                // blocked/done while its own workspace was focused.
+                record_attention(pane);
                 // Fresh snapshot to decide background (no subscribable focus event).
                 if let Some(s) = snapshot() {
                     if ws != focused_ws(&s) {

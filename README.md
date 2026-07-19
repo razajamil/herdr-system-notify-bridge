@@ -5,6 +5,14 @@ agent in a **background** workspace needs you (`blocked`) or finishes (`done`),
 you get a macOS notification — and **clicking it jumps you straight to that
 exact pane**.
 
+There's also a **global hotkey** (`cmd+shift+J` by default): press it to jump
+to the agent that most recently needed attention — with no mouse, and whether or
+not there's a live notification. macOS gives third-party apps no way to bind a
+key to a notification banner itself, so the daemon instead records the last
+attention pane to a state file and the hotkey focuses it. That means it also
+works when the toast is gone, was dismissed, or never fired (the agent's own
+workspace was focused at the time).
+
 ## Why this exists
 
 herdr can't do click-to-pane itself on modern macOS (Sequoia/Tahoe):
@@ -47,9 +55,15 @@ auto-reconnects if the herdr server restarts.
 
 | Piece | Where | Role |
 |---|---|---|
-| **daemon** (this crate) | `~/.local/bin/herdr-system-notify-bridge` | Watches herdr, fires click-to-focus toasts |
+| **daemon** (this crate) | `~/.local/bin/herdr-system-notify-bridge` | Watches herdr, fires click-to-focus toasts, records the last attention pane |
 | **URL handler** | `~/.config/herdr/HerdrFocus.app` | Owns `herdrfocus://`; runs `herdr agent focus <pane>` on click |
+| **focus-last helper** | `~/.local/bin/herdr-focus-last` | Reads `last-attention-pane`, focuses it + raises the terminal (hotkey target) |
+| **hotkey** | `~/.config/skhd/skhdrc` (skhd) | Binds `cmd+shift+J` → `herdr-focus-last` |
 | **LaunchAgent** | `~/Library/LaunchAgents/dev.local.herdr-notify.plist` | Runs the daemon at login, keeps it alive |
+
+The daemon writes the most-recent blocked/done pane id to
+`~/.config/herdr/last-attention-pane` on every attention transition (before
+deciding whether to toast), which is what the hotkey reads.
 
 ## Requirements
 
@@ -57,6 +71,9 @@ auto-reconnects if the herdr server restarts.
 - [herdr](https://herdr.dev) running (`~/.config/herdr/herdr.sock` present)
 - `terminal-notifier` — `brew install terminal-notifier` (expected at
   `/opt/homebrew/bin/terminal-notifier`)
+- `skhd` — `brew install koekeishiya/formulae/skhd` (it's in the maintainer's
+  tap, not homebrew-core; for the global focus-last hotkey — optional if you
+  only want click-to-focus)
 - Rust toolchain to build (`cargo`)
 
 ## Setup
@@ -153,6 +170,34 @@ delivery = "off"
 System Settings → Notifications → **terminal-notifier** → Allow Notifications on,
 **Alert style = Alerts** (banners auto-dismiss; alerts persist). Otherwise
 notifications only land silently in Notification Center.
+
+### 6. Global focus-last hotkey (skhd)
+
+`install.sh` installs the `herdr-focus-last` helper to `~/.local/bin` and, if
+`skhd` is present, adds this binding to `~/.config/skhd/skhdrc`:
+
+```
+cmd + shift - j : ~/.local/bin/herdr-focus-last
+```
+
+If skhd wasn't installed when you first ran `install.sh`:
+
+```sh
+brew install koekeishiya/formulae/skhd   # in the maintainer's tap, not core
+./install.sh              # re-run: registers the binding, reloads skhd
+skhd --start-service      # first-time service start
+```
+
+On first start macOS will prompt for Accessibility permission — grant it under
+**System Settings → Privacy & Security → Accessibility → skhd**, or the hotkey
+silently won't fire. Rebind the key by editing `~/.config/skhd/skhdrc` (see
+`skhd-herdr-focus.conf` for the syntax) and running `skhd --restart-service`.
+
+You can test the helper without a hotkey at all:
+
+```sh
+~/.local/bin/herdr-focus-last   # jumps to the last agent that needed attention
+```
 
 ## Managing it
 

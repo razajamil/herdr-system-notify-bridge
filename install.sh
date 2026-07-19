@@ -23,6 +23,29 @@ mkdir -p "$HOME/.local/bin"
 cp "$SCRIPT_DIR/target/release/$BIN_NAME" "$DEST"
 echo "    installed $DEST"
 
+echo "==> installing herdr-focus-last helper"
+FOCUS_LAST="$HOME/.local/bin/herdr-focus-last"
+install -m 0755 "$SCRIPT_DIR/herdr-focus-last.sh" "$FOCUS_LAST"
+echo "    installed $FOCUS_LAST"
+
+echo "==> registering skhd focus-last hotkey"
+SKHDRC="$HOME/.config/skhd/skhdrc"
+BINDING='cmd + shift - j : ~/.local/bin/herdr-focus-last'
+if command -v skhd >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$SKHDRC")"
+    touch "$SKHDRC"
+    if grep -qF 'herdr-focus-last' "$SKHDRC"; then
+        echo "    binding already present in $SKHDRC (left as-is)"
+    else
+        printf '\n# herdr focus-last: jump to the agent that most recently needed attention\n%s\n' "$BINDING" >> "$SKHDRC"
+        echo "    added '$BINDING' to $SKHDRC"
+    fi
+    skhd --restart-service 2>/dev/null || skhd --reload 2>/dev/null || true
+    echo "    reloaded skhd"
+else
+    echo "    skhd not installed — skipping (see manual step 3 below)"
+fi
+
 echo "==> building + registering HerdrFocus.app (herdrfocus:// handler)"
 rm -rf "$APP"
 osacompile -o "$APP" "$SCRIPT_DIR/HerdrFocus.applescript"
@@ -60,6 +83,15 @@ cat <<EOF
 
   2) System Settings -> Notifications -> terminal-notifier:
          Allow Notifications = ON, Alert style = Alerts
+
+  3) Global focus-last hotkey (cmd+shift+J -> jump to the last agent that
+     needed attention, notification or not). If skhd wasn't installed above:
+         brew install koekeishiya/formulae/skhd   # maintainer's tap, not core
+         ./install.sh        # re-run to register the binding
+         skhd --start-service # first-time service start; grant Accessibility
+                              # permission when macOS prompts (System Settings
+                              # -> Privacy & Security -> Accessibility -> skhd)
+     Rebind the key by editing ~/.config/skhd/skhdrc.
 
   Logs:   ~/.config/herdr/herdr-notify-bridge.log   (fires)
           ~/.config/herdr/herdrfocus.log            (clicks)
