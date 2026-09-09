@@ -47,9 +47,16 @@ The daemon connects to the herdr socket, `events.subscribe`s to
 `pane.agent_status_changed` for every agent pane, and reacts to the event
 stream in real time (≈1s, no polling). On each `blocked`/`done` transition it
 takes a fresh `session.snapshot` to check whether that pane's workspace is
-focused; if not, it fires the toast. New agent panes are picked up by a 15s
-rediscovery sweep (herdr has no subscribable "pane created" event). It
+focused; if not, it fires the toast. New agent panes arrive as
+`pane.created`/`pane.agent_detected` events and are picked up at once. It
 auto-reconnects if the herdr server restarts.
+
+A subscription can't be extended once it is live (see the protocol notes
+below), so adopting a new pane means reconnecting with a wider subscription.
+The daemon carries each pane's last-known status across that reconnect and
+diffs it against a snapshot taken *after* the new subscription is live, so a
+transition that lands in the gap still fires. A 60s snapshot resync backs that
+up in case the stream ever drops an event.
 
 ## Components
 
@@ -68,7 +75,11 @@ deciding whether to toast), which is what the hotkey reads.
 ## Requirements
 
 - macOS (arm64 or x86_64)
-- [herdr](https://herdr.dev) running (`~/.config/herdr/herdr.sock` present)
+- [herdr](https://herdr.dev) **0.9+** running (`~/.config/herdr/herdr.sock`
+  present). The socket protocol changed in 0.9 in ways that need the client to
+  cooperate — see the protocol notes at the end. This daemon targets 0.9
+  (protocol 22) and subscribes to pane-lifecycle events that 0.8 doesn't
+  offer, so it is not expected to work against 0.8.
 - `terminal-notifier` — `brew install terminal-notifier` (expected at
   `/opt/homebrew/bin/terminal-notifier`)
 - `skhd` — `brew install koekeishiya/formulae/skhd` (it's in the maintainer's
@@ -227,14 +238,16 @@ Constants at the top of `src/main.rs`:
 | Constant | Default | Meaning |
 |---|---|---|
 | `ATTENTION` | `["blocked", "done"]` | Which agent states trigger a notification |
-| `REDISCOVER` | `15s` | How often to scan for newly-created agent panes |
+| `RESYNC` | `60s` | Safety-net snapshot diff, in case the stream drops an event |
+| `LIFECYCLE` | `pane.created`, `pane.agent_detected`, `pane.closed`, `pane.exited` | Pane-lifecycle events subscribed alongside the per-pane status ones |
 | `TERMINAL_NOTIFIER` | `/opt/homebrew/bin/terminal-notifier` | Notifier path |
 
 Per-status sounds (`Sosumi` for blocked, `Glass` for done) are in `notify()`.
 
 ## herdr socket protocol (reference)
 
-Verified against a live `~/.config/herdr/herdr.sock`:
+Verified against a live `~/.config/herdr/herdr.sock` on **herdr 0.9.0,
+protocol 22**. `herdr api schema --json` dumps the whole thing.
 
 - **Framing:** newline-delimited JSON.
 - **Request:** `{"id","method","params"}` — `params` is required even for `ping`.
@@ -242,12 +255,46 @@ Verified against a live `~/.config/herdr/herdr.sock`:
   (`focused_workspace_id`, `workspaces[]`, `agents[]`).
 - **Subscribe:** `events.subscribe`, params
   `{"subscriptions":[{"type":"pane.agent_status_changed","pane_id":"w1:p4"}]}`.
-  `pane_id` is **required** — subscriptions are per-pane (no wildcard), and there
-  is no subscribable pane-created event (hence the rediscovery sweep).
-- **Event:** `{"event":"pane.agent_status_changed","data":{"agent","agent_status","pane_id","workspace_id"}}`.
+  Acked with `{"result":{"type":"subscription_started"}}`.
+- **Event (status probe, dotted kind):**
+  `{"event":"pane.agent_status_changed","data":{"agent","agent_status","pane_id","workspace_id"}}`.
+- **Event (lifecycle, snake_case kind):**
+  `{"event":"pane_created","data":{"type":"pane_created","pane":{…}}}`;
+  `pane_closed`/`pane_exited` carry `pane_id` + `workspace_id` directly.
+  Note the two envelopes use different naming for the same concept — the
+  *subscription* is `pane.created`, the *event* that arrives is `pane_created`.
 - Agent states: `idle`, `working`, `blocked`, `done`, `unknown`. A Claude turn
   *finishing* is `idle` (not an attention state); `blocked` = waiting on a
-  prompt/question; opencode completion is `done`.
+  prompt/question; opencode completion is `done`. Reporting `idle` on a pane
+  that is currently `blocked` yields `done`, not `idle`.
+
+Three behaviours that constrain any client (all three broke this daemon on the
+0.8 → 0.9 upgrade):
+
+- **`events.subscribe` is terminal for its connection.** Once it is acked, the
+  socket is a one-way event stream: *any* further request on it — a second
+  `events.subscribe`, even a `ping` — makes the server close the connection.
+  Subscribe once per connection, and use a separate connection for
+  `session.snapshot` and everything else.
+- **One bad `pane_id` fails the whole batch.** A pane that closed between the
+  snapshot and the subscribe gets you
+  `{"error":{"code":"pane_not_found"},"id":"<req>:sub:<index>:probe"}` and the
+  connection closes — no subscription at all, not a partial one. Check the ack;
+  the offending entry's batch index is in the error `id`.
+- **No history replay.** Per the 0.9 notes, "new lifecycle event subscriptions
+  now start with live events rather than replaying retained history. API
+  clients should subscribe before taking their initial snapshot to avoid
+  missing changes." Anything that happens before the subscription goes live is
+  gone unless you diff it back out of a snapshot yourself.
+
+Subscribable types (27 in protocol 22): `workspace.{created,updated,
+metadata_updated,renamed,moved,reordered,closed,focused}`,
+`worktree.{created,opened,removed}`, `tab.{created,closed,focused,renamed,moved}`,
+`pane.{created,closed,updated,focused,moved,exited,agent_detected,
+output_matched,agent_status_changed,scroll_changed}`, `layout.updated`.
+Only `pane.agent_status_changed`, `pane.output_matched` and
+`pane.scroll_changed` take a `pane_id` (required — there is no wildcard); the
+rest are global.
 
 ## Caveats
 
