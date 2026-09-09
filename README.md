@@ -1,31 +1,46 @@
 # herdr-system-notify-bridge
 
-Click-to-focus desktop notifications for [herdr](https://herdr.dev). When an
-agent in a **background** workspace needs you (`blocked`) or finishes (`done`),
-you get a macOS notification — and **clicking it jumps you straight to that
-exact pane**.
-
-There's also a **global hotkey** (`cmd+shift+J` by default): press it to jump
-to the agent that most recently needed attention — with no mouse, and whether or
-not there's a live notification. macOS gives third-party apps no way to bind a
-key to a notification banner itself, so the daemon instead records the last
-attention pane to a state file and the hotkey focuses it. That means it also
-works when the toast is gone, was dismissed, or never fired (the agent's own
-workspace was focused at the time).
+Desktop notifications for [herdr](https://herdr.dev) with a global
+jump-to-the-agent hotkey. When an agent in a **background** workspace needs you
+(`blocked`) or finishes (`done`), you get a macOS notification; press
+`cmd+shift+J` (from any app) and your herdr client jumps to that agent.
 
 ## Why this exists
 
-herdr can't do click-to-pane itself on modern macOS (Sequoia/Tahoe):
+herdr can show its own notifications, but the two things you want — a *desktop*
+notification and a keypress that *jumps to the agent* — can't come from herdr
+alone:
 
-- its built-in system notifications use `terminal-notifier -activate`, which
-  only focuses the **app**, not a specific pane;
-- `terminal-notifier`'s `-execute` (run-a-command-on-click) is **broken** on
-  modern macOS (deprecated `NSUserNotification`).
+- `keys.open_notification_target` (`prefix+o`) is the only thing that can move
+  the view, and it only has a target when `[ui.toast] delivery = "herdr"`,
+  i.e. an **in-app** toast. That tells you nothing while you're in a browser.
+- With `delivery = "system"` or `"terminal"` you get a desktop notification but
+  **no jump target** — `prefix+o` does nothing (verified on 0.9.0).
 
-But `terminal-notifier -open <url>` **does** still fire on click, and
-`herdr agent focus <pane>` works. This bridge stitches those together: it fires
-notifications wired with `-open herdrfocus://focus/<pane>`, and a tiny URL
-handler turns that click into `herdr agent focus <pane>`.
+So the two halves are split: herdr shows the in-app toast that gives `prefix+o`
+its target, this daemon fires the desktop notification, and the hotkey types
+`prefix+o` into the herdr client for you.
+
+## Why the click went away
+
+Up to herdr 0.8 the toast itself was clickable: it carried
+`-open herdrfocus://focus/<pane>`, and a small `HerdrFocus.app` URL handler
+turned the click into `herdr agent focus <pane>`.
+
+**herdr 0.9 killed that, and nothing can bring it back.** 0.9 moved the terminal
+UI inside each client, and clients view workspaces independently, so
+`herdr agent focus`:
+
+- sets **server-side** focus and marks the agent **seen** (its badge clears), but
+- does **not** move any client's view.
+
+herdr's socket API has no method to move a client's view — only a client-side
+keybinding does. So a toast click, or any external process, is structurally
+unable to jump to a pane. The `herdrfocus://` handler and `HerdrFocus.app` are
+gone; the hotkey drives the client instead, via kitty's remote control.
+
+The toast is therefore informational: it says which pane wants you and reminds
+you of the hotkey.
 
 ## How it works
 
@@ -35,12 +50,15 @@ handler turns that click into `herdr agent focus <pane>`.
                                             │  in a NON-focused workspace
                                             ▼
                                    terminal-notifier
-                                   (macOS toast, -open herdrfocus://focus/<pane>)
-                                            │
-                                     you click it
+                                   (macOS toast — informational, not clickable)
+
+ you press cmd+shift+J  ──▶  skhd  ──▶  herdr-focus-last
+                                            │  raise kitty, then
+                                            │  kitty @ send-text $'\x02o'
                                             ▼
-                                   HerdrFocus.app  (herdrfocus:// URL handler)
-                                   → `herdr agent focus <pane>` + raise the terminal
+                                   herdr client  (prefix+o =
+                                   keys.open_notification_target)
+                                   → the client moves its own view
 ```
 
 The daemon connects to the herdr socket, `events.subscribe`s to
@@ -62,15 +80,13 @@ up in case the stream ever drops an event.
 
 | Piece | Where | Role |
 |---|---|---|
-| **daemon** (this crate) | `~/.local/bin/herdr-system-notify-bridge` | Watches herdr, fires click-to-focus toasts, records the last attention pane |
-| **URL handler** | `~/.config/herdr/HerdrFocus.app` | Owns `herdrfocus://`; runs `herdr agent focus <pane>` on click |
-| **focus-last helper** | `~/.local/bin/herdr-focus-last` | Reads `last-attention-pane`, focuses it + raises the terminal (hotkey target) |
+| **daemon** (this crate) | `~/.local/bin/herdr-system-notify-bridge` | Watches herdr, fires the desktop toast + sound |
+| **focus-last helper** | `~/.local/bin/herdr-focus-last` | Raises kitty and types `prefix+o` into the herdr client (hotkey target) |
 | **hotkey** | `~/.config/skhd/skhdrc` (skhd) | Binds `cmd+shift+J` → `herdr-focus-last` |
 | **LaunchAgent** | `~/Library/LaunchAgents/dev.local.herdr-notify.plist` | Runs the daemon at login, keeps it alive |
 
-The daemon writes the most-recent blocked/done pane id to
-`~/.config/herdr/last-attention-pane` on every attention transition (before
-deciding whether to toast), which is what the hotkey reads.
+The daemon keeps no state of its own: herdr picks the jump target, so which
+agent you land on is herdr's notion of the current notification target.
 
 ## Requirements
 
@@ -83,21 +99,32 @@ deciding whether to toast), which is what the hotkey reads.
 - `terminal-notifier` — `brew install terminal-notifier` (expected at
   `/opt/homebrew/bin/terminal-notifier`)
 - `skhd` — `brew install koekeishiya/formulae/skhd` (it's in the maintainer's
-  tap, not homebrew-core; for the global focus-last hotkey — optional if you
-  only want click-to-focus)
+  tap, not homebrew-core; needed for the global hotkey)
+- **kitty with remote control enabled** — the hotkey types into the herdr
+  client through it, so `~/.config/kitty/kitty.conf` needs:
+  ```
+  allow_remote_control yes
+  listen_on unix:/tmp/kitty-{kitty_pid}
+  ```
+  (then fully restart kitty). Another terminal works only if it can inject
+  keystrokes into a window from outside; change `TERM_BUNDLE` and the send
+  command in `herdr-focus-last.sh`.
+- **`[ui.toast] delivery = "herdr"` in herdr's config** — anything else (and
+  especially `"off"`) leaves `prefix+o` with no target, and the hotkey silently
+  does nothing.
 - Rust toolchain to build (`cargo`)
 
 ## Setup
 
-**Quick install** — build, install the binary, register the URL handler, and
-load the LaunchAgent in one shot:
+**Quick install** — build and install the daemon, the hotkey helper, the skhd
+binding and the LaunchAgent in one shot:
 
 ```sh
 ./install.sh
 ```
 
-Then do the two manual steps it prints (steps 4 & 5 below). The rest of this
-section documents what `install.sh` does, for reference or manual setup.
+Then do the manual steps it prints (steps 3–5 below). The rest of this section
+documents what `install.sh` does, for reference or manual setup.
 
 ### 1. Build & install the daemon
 
@@ -106,41 +133,21 @@ cargo build --release
 cp target/release/herdr-system-notify-bridge ~/.local/bin/
 ```
 
-### 2. Install the `herdrfocus://` URL handler
+### 2. Enable kitty remote control
 
-Create `~/.config/herdr/HerdrFocus.app` from this AppleScript (pane id is taken
-as everything after the last `/`, so the `:` in pane ids like `w1:p4` is safe):
+The hotkey jumps by typing herdr's own `prefix+o` into the herdr client, which
+needs kitty's remote control. In `~/.config/kitty/kitty.conf`:
 
-```applescript
-on open location this_URL
-	set AppleScript's text item delimiters to "/"
-	set parts to text items of this_URL
-	set paneId to last item of parts
-	set AppleScript's text item delimiters to ""
-	if paneId is "" then return
-	set herdr to (POSIX path of (path to home folder)) & ".local/bin/herdr"
-	do shell script quoted form of herdr & " agent focus " & quoted form of paneId & " ; /usr/bin/open -b net.kovidgoyal.kitty"
-end open location
+```
+allow_remote_control yes
+listen_on unix:/tmp/kitty-{kitty_pid}
 ```
 
-Compile and register it:
+Then **fully restart kitty** (config reload does not open the socket).
 
-```sh
-osacompile -o ~/.config/herdr/HerdrFocus.app HerdrFocus.applescript
-# declare the URL scheme
-plist=~/.config/herdr/HerdrFocus.app/Contents/Info.plist
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier dev.local.herdrfocus" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string dev.local.herdrfocus" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string herdrfocus" "$plist"
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f ~/.config/herdr/HerdrFocus.app
-open ~/.config/herdr/HerdrFocus.app   # launch once to clear macOS first-run
-```
-
-> The app must be launched once (or have its quarantine attribute cleared)
-> before macOS will route `herdrfocus://` URLs to it.
+The helper finds the client itself — it scans `/tmp/kitty-*` for the window
+whose foreground process is `herdr` — because skhd runs it with no kitty
+environment variables.
 
 ### 3. Install the LaunchAgent
 
@@ -165,16 +172,24 @@ open ~/.config/herdr/HerdrFocus.app   # launch once to clear macOS first-run
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.local.herdr-notify.plist
 ```
 
-### 4. Turn off herdr's own notifications (avoid duplicates)
+### 4. herdr config (required — this is what makes the hotkey work)
 
 In `~/.config/herdr/config.toml`:
 
 ```toml
-[ui.sound]
-enabled = false
 [ui.toast]
-delivery = "off"
+delivery = "herdr"   # in-app toast; this is what prefix+o jumps to.
+                     # "off", "system" and "terminal" all leave prefix+o
+                     # with no target, and the hotkey does nothing.
+[ui.sound]
+enabled = false      # this daemon plays the sounds, so herdr's stay off
 ```
+
+Then `herdr server reload-config`.
+
+You will see two things per event: herdr's small in-app toast (which powers the
+jump) and this daemon's desktop notification. That duplication is the price of
+having both a desktop alert and a working jump — see **Why this exists**.
 
 ### 5. macOS notification permission
 
@@ -182,7 +197,7 @@ System Settings → Notifications → **terminal-notifier** → Allow Notificati
 **Alert style = Alerts** (banners auto-dismiss; alerts persist). Otherwise
 notifications only land silently in Notification Center.
 
-### 6. Global focus-last hotkey (skhd)
+### 6. Global hotkey (skhd)
 
 `install.sh` installs the `herdr-focus-last` helper to `~/.local/bin` and, if
 `skhd` is present, adds this binding to `~/.config/skhd/skhdrc`:
@@ -204,11 +219,17 @@ On first start macOS will prompt for Accessibility permission — grant it under
 silently won't fire. Rebind the key by editing `~/.config/skhd/skhdrc` (see
 `skhd-herdr-focus.conf` for the syntax) and running `skhd --restart-service`.
 
-You can test the helper without a hotkey at all:
+You can test the helper without a hotkey at all — including in a bare
+environment, the way skhd will run it:
 
 ```sh
-~/.local/bin/herdr-focus-last   # jumps to the last agent that needed attention
+env -i HOME="$HOME" PATH=/usr/bin:/bin ~/.local/bin/herdr-focus-last
 ```
+
+It logs what it did to `~/.config/herdr/herdrfocus.log`. If it logs
+`no herdr client window found in kitty`, remote control isn't enabled (step 2).
+If it logs a successful send but nothing moves, herdr has no notification
+target — check `[ui.toast] delivery` (step 4).
 
 ## Managing it
 
@@ -221,7 +242,7 @@ launchctl bootout gui/$(id -u)/dev.local.herdr-notify
 launchctl print gui/$(id -u)/dev.local.herdr-notify
 # logs
 tail -f ~/.config/herdr/herdr-notify-bridge.log      # what the daemon fired
-tail -f ~/.config/herdr/herdrfocus.log               # what clicks focused
+tail -f ~/.config/herdr/herdrfocus.log               # what the hotkey did
 ```
 
 Update after editing the code:
@@ -241,8 +262,13 @@ Constants at the top of `src/main.rs`:
 | `RESYNC` | `60s` | Safety-net snapshot diff, in case the stream drops an event |
 | `LIFECYCLE` | `pane.created`, `pane.agent_detected`, `pane.closed`, `pane.exited` | Pane-lifecycle events subscribed alongside the per-pane status ones |
 | `TERMINAL_NOTIFIER` | `/opt/homebrew/bin/terminal-notifier` | Notifier path |
+| `HOTKEY_HINT` | `cmd+shift+J` | Shown in the toast body; keep in step with the skhd binding |
 
 Per-status sounds (`Sosumi` for blocked, `Glass` for done) are in `notify()`.
+
+The hotkey side is tuned in `herdr-focus-last.sh`: `KITTY_BIN`, `TERM_BUNDLE`,
+and `HERDR_JUMP_KEYS` (default `$'\002o'` = `prefix+o`) — change the last one
+if you rebound herdr's `prefix` or `open_notification_target`.
 
 ## herdr socket protocol (reference)
 
@@ -298,12 +324,20 @@ rest are global.
 
 ## Caveats
 
-- **Split tabs:** if an agent shares its tab with another pane, `agent focus`
-  sets the server focus onto the agent pane, but you'll see the whole split.
-  To land unambiguously, `notify()` could additionally run
-  `herdr pane zoom <pane> --on`.
-- Assumes **kitty** as the terminal (the URL handler raises
-  `net.kovidgoyal.kitty`). Change the bundle id in the AppleScript for other
-  terminals.
-- Paths to `terminal-notifier` and the binary are effectively hardcoded for a
-  Homebrew/`~/.local/bin` layout.
+- **The toast is not clickable.** Clicking it does nothing at all — the hotkey
+  is the only way to jump. See **Why the click went away**.
+- **herdr picks the target, not this daemon.** The hotkey goes wherever herdr's
+  notification target points, which is generally the most recent one. There's no
+  cycling through several waiting agents; for that, bind herdr's own
+  `next_agent`/`previous_agent` (unset by default) in `[keys]`.
+- **You get two alerts per event** — herdr's in-app toast plus this daemon's
+  desktop one. Unavoidable if you want both a desktop alert and a working jump.
+- **Duplicate herdr clients:** the helper types into the first kitty window it
+  finds running `herdr`. With several herdr clients open it may drive the wrong
+  one.
+- Assumes **kitty** as the terminal, and needs its remote control enabled — the
+  hotkey injects keystrokes through it. Other terminals need an equivalent
+  mechanism; change `TERM_BUNDLE` and the send command in
+  `herdr-focus-last.sh`.
+- Paths to `terminal-notifier`, `kitty` and the binary are effectively
+  hardcoded for a Homebrew/`~/.local/bin`/`/Applications` layout.

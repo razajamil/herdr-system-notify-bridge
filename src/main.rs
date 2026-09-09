@@ -2,13 +2,22 @@
 //!
 //! Connects to the herdr socket, subscribes to `pane.agent_status_changed`
 //! events for every agent pane, and — when a pane enters `blocked`/`done`
-//! while its workspace is NOT focused — fires a macOS notification whose click
-//! focuses that exact pane via the `herdrfocus://` URL handler (HerdrFocus.app).
+//! while its workspace is NOT focused — fires a macOS desktop notification.
 //!
-//! herdr can't do click-to-pane itself on modern macOS: its notifications use
-//! `terminal-notifier -activate` (app only) and `-execute` is dead on Tahoe.
-//! `-open <url>` still fires on click, so we route clicks through
-//! `herdrfocus://focus/<pane>` -> `herdr agent focus <pane>`.
+//! This exists only because herdr's own desktop delivery can't drive the jump:
+//! `[ui.toast] delivery` has to be `"herdr"` (an in-app toast) for
+//! `keys.open_notification_target` to have a target, and that gives no
+//! notification at all when you're in another app. So herdr shows the in-app
+//! toast that powers the jump, and this daemon supplies the desktop one.
+//!
+//! The toast is NOT clickable. Up to herdr 0.8 it carried
+//! `-open herdrfocus://focus/<pane>`, and the click ran `herdr agent focus`.
+//! Under 0.9 the terminal UI runs inside each client and clients view
+//! workspaces independently, so `agent focus` only moves SERVER-side focus and
+//! marks the agent seen — it cannot move a client's view, and no socket API
+//! can. Only a client keybinding does, so jumping now goes through
+//! `herdr-focus-last`, which types herdr's own `open_notification_target`
+//! chord into the client with kitty's remote control.
 //!
 //! Protocol (herdr 0.9, protocol 22 — verified against the live socket):
 //!   framing  : newline-delimited JSON; request {"id","method","params"}
@@ -50,6 +59,9 @@ use std::thread;
 use std::time::Duration;
 
 const TERMINAL_NOTIFIER: &str = "/opt/homebrew/bin/terminal-notifier";
+/// Shown in the toast body, since the toast itself is no longer clickable.
+/// Keep in step with the skhd binding in `skhd-herdr-focus.conf`.
+const HOTKEY_HINT: &str = "cmd+shift+J";
 const ATTENTION: [&str; 2] = ["blocked", "done"];
 /// Safety-net reconcile. Events drive discovery now, so this only catches what
 /// the stream may have dropped. It never writes to the event stream.
@@ -74,20 +86,6 @@ fn sock_path() -> String {
 fn log_path() -> String {
     format!("{}/.config/herdr/herdr-notify-bridge.log", home())
 }
-/// Pane id of the most recent agent to enter an attention state. Written on
-/// every `blocked`/`done` transition (whether or not a notification fired), so
-/// the `herdr-focus-last` hotkey can jump there even with no live toast.
-fn last_attention_path() -> String {
-    format!("{}/.config/herdr/last-attention-pane", home())
-}
-
-/// Record the most-recently-attention pane for the focus-last hotkey.
-fn record_attention(pane: &str) {
-    if let Err(e) = std::fs::write(last_attention_path(), pane) {
-        log(&format!("failed to record last-attention pane {}: {}", pane, e));
-    }
-}
-
 fn now() -> String {
     Command::new("/bin/date")
         .arg("+%Y-%m-%d %H:%M:%S")
@@ -127,6 +125,17 @@ struct Row {
     status: String,
     ws: String,
     agent: String,
+}
+
+/// Everything that has to survive a reconnect.
+#[derive(Default)]
+struct State {
+    /// Last-known `agent_status` per pane. Carried across reconnects so a
+    /// snapshot diff can recover transitions the event stream never delivered.
+    prev: HashMap<String, String>,
+    /// Whether we've taken our first baseline (before which we adopt statuses
+    /// silently instead of toasting a whole session of already-blocked agents).
+    seeded: bool,
 }
 
 fn agent_rows(snap: &Value) -> HashMap<String, Row> {
@@ -260,8 +269,10 @@ fn notify(pane: &str, status: &str, agent: &str, ws_label: &str) {
         _ => "default",
     };
     let title = format!("{} {} {}", emoji, agent, verb);
-    let message = format!("→ {}  (click to jump)", pane);
-    let url = format!("herdrfocus://focus/{}", pane);
+    // Clicking a toast can no longer jump anywhere: under 0.9 only a herdr
+    // client keybinding can move the view (see the module docs), so there is
+    // no `-open herdrfocus://` URL to attach. The hotkey is the way in.
+    let message = format!("→ {}  ({} to jump)", pane, HOTKEY_HINT);
     let group = format!("herdr-notify-{}", pane);
     let _ = Command::new(TERMINAL_NOTIFIER)
         .args([
@@ -270,7 +281,6 @@ fn notify(pane: &str, status: &str, agent: &str, ws_label: &str) {
             "-message", &message,
             "-group", &group,
             "-sound", sound,
-            "-open", &url,
         ])
         .output();
     log(&format!(
@@ -279,10 +289,9 @@ fn notify(pane: &str, status: &str, agent: &str, ws_label: &str) {
     ));
 }
 
-/// An attention transition we know about: record it for the hotkey, and toast
-/// it if its workspace isn't the one on screen.
+/// An attention transition we know about: toast it if its workspace isn't the
+/// one on screen.
 fn raise(pane: &str, row: &Row, snap: &Value, focused: &str) {
-    record_attention(pane);
     if row.ws != focused {
         notify(pane, &row.status, &row.agent, &ws_label(snap, &row.ws));
     }
@@ -295,14 +304,14 @@ fn raise(pane: &str, row: &Row, snap: &Value, focused: &str) {
 /// first start, so a session full of already-blocked agents stays quiet).
 ///
 /// Returns the current agent pane set.
-fn reconcile(snap: &Value, prev: &mut HashMap<String, String>, seed: bool) -> HashSet<String> {
+fn reconcile(snap: &Value, state: &mut State, seed: bool) -> HashSet<String> {
     let rows = agent_rows(snap);
     let focused = focused_ws(snap);
     for (pane, row) in &rows {
-        let was = prev.get(pane).cloned().unwrap_or_default();
+        let was = state.prev.get(pane).cloned().unwrap_or_default();
         let entered =
             ATTENTION.contains(&row.status.as_str()) && !ATTENTION.contains(&was.as_str());
-        prev.insert(pane.clone(), row.status.clone());
+        state.prev.insert(pane.clone(), row.status.clone());
         if seed || !entered {
             continue;
         }
@@ -312,7 +321,7 @@ fn reconcile(snap: &Value, prev: &mut HashMap<String, String>, seed: bool) -> Ha
         ));
         raise(pane, row, snap, &focused);
     }
-    prev.retain(|p, _| rows.contains_key(p));
+    state.prev.retain(|p, _| rows.contains_key(p));
     rows.into_keys().collect()
 }
 
@@ -333,10 +342,10 @@ struct Resubscribe;
 
 /// One connect + subscribe + event loop.
 ///
-/// `prev` is carried across calls on purpose: it is the pre-gap status that
-/// `reconcile` diffs the post-subscribe snapshot against, which is how
-/// transitions during a reconnect still get notified.
-fn run(prev: &mut HashMap<String, String>, seeded: &mut bool) -> Result<Resubscribe, String> {
+/// `state` is carried across calls on purpose: its `prev` is the pre-gap
+/// status that `reconcile` diffs the post-subscribe snapshot against, which is
+/// how transitions during a reconnect still get notified.
+fn run(state: &mut State) -> Result<Resubscribe, String> {
     // Discover the pane set to subscribe to. This snapshot is only used for
     // pane ids — the baseline statuses come from the one taken after the
     // subscription is live.
@@ -350,13 +359,13 @@ fn run(prev: &mut HashMap<String, String>, seeded: &mut bool) -> Result<Resubscr
     // Baseline: everything from here on arrives as an event, and anything that
     // changed before the subscription went live is recovered by this diff.
     let base = snapshot().ok_or("baseline snapshot failed")?;
-    let live = reconcile(&base, prev, !*seeded);
-    if !*seeded {
+    let live = reconcile(&base, state, !state.seeded);
+    if !state.seeded {
         log(&format!(
             "seeded {} agent panes (no toasts on first sync)",
             live.len()
         ));
-        *seeded = true;
+        state.seeded = true;
     }
     log(&format!("subscribed to {} agent panes", subscribed.len()));
 
@@ -434,8 +443,8 @@ fn run(prev: &mut HashMap<String, String>, seeded: &mut bool) -> Result<Resubscr
                         .unwrap_or("agent")
                         .to_string(),
                 };
-                let was = prev.get(pane).cloned().unwrap_or_default();
-                prev.insert(pane.to_string(), row.status.clone());
+                let was = state.prev.get(pane).cloned().unwrap_or_default();
+                state.prev.insert(pane.to_string(), row.status.clone());
 
                 let entered =
                     ATTENTION.contains(&row.status.as_str()) && !ATTENTION.contains(&was.as_str());
@@ -454,7 +463,7 @@ fn run(prev: &mut HashMap<String, String>, seeded: &mut bool) -> Result<Resubscr
                 // Only reconnect if a pane we aren't watching really has an
                 // agent — plain shell panes fire pane_created too.
                 if let Some(s) = snapshot() {
-                    let live = reconcile(&s, prev, false);
+                    let live = reconcile(&s, state, false);
                     if let Some(new) = live.difference(&subscribed).next() {
                         log(&format!("new agent pane {}; resubscribing", new));
                         return Ok(Resubscribe);
@@ -462,7 +471,7 @@ fn run(prev: &mut HashMap<String, String>, seeded: &mut bool) -> Result<Resubscr
                 }
             }
             Ok(Msg::PaneGone(pane)) => {
-                prev.remove(&pane);
+                state.prev.remove(&pane);
                 subscribed.remove(&pane);
             }
             Ok(Msg::Disconnected) => return Err("event stream disconnected".into()),
@@ -470,7 +479,7 @@ fn run(prev: &mut HashMap<String, String>, seeded: &mut bool) -> Result<Resubscr
                 // Safety net: recover anything the stream dropped, and notice
                 // panes whose creation event we somehow missed.
                 if let Some(s) = snapshot() {
-                    let live = reconcile(&s, prev, false);
+                    let live = reconcile(&s, state, false);
                     if let Some(new) = live.difference(&subscribed).next() {
                         log(&format!("resync found unwatched agent pane {}", new));
                         return Ok(Resubscribe);
@@ -485,11 +494,11 @@ fn run(prev: &mut HashMap<String, String>, seeded: &mut bool) -> Result<Resubscr
 fn main() {
     log("bridge started (rust, event-driven, herdr 0.9 protocol)");
     // Carried across reconnects so `reconcile` can spot transitions that
-    // happened while we had no subscription.
-    let mut prev: HashMap<String, String> = HashMap::new();
-    let mut seeded = false;
+    // happened while we had no subscription, and so the hotkey queue survives
+    // a resubscribe.
+    let mut state = State::default();
     loop {
-        match run(&mut prev, &mut seeded) {
+        match run(&mut state) {
             // Planned reconnect to widen the subscription: no backoff.
             Ok(Resubscribe) => {}
             Err(e) => {
